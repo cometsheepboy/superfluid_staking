@@ -7,17 +7,24 @@ import { ISuperfluid, ISuperToken, ISuperApp, ISuperAgreement } from "@superflui
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "forge-std/console.sol";
 
-contract StreamingStaking is CFASuperAppBase{
-    IConstantFlowAgreementV1 public cfa;
+contract StreamingStaking is CFASuperAppBase {
+    ISuperfluid public immutable host;
+    IConstantFlowAgreementV1 public immutable cfa;
 
-    ISuperToken public stakingTokenX;
-    IERC20 public rewardTokenY;
+    ISuperToken public immutable stakingTokenX;
+    IERC20 public immutable rewardTokenY;
+
+    uint256 public rewardRatePerSecond;
+    uint256 public totalFlowRate;
+
+    uint256 public accRewardPerShare; // Scaled by 1e18
+    uint256 public lastRewardTime;
     uint256 public totalRewardReceived;
 
     struct UserInfo {
-        int96 flowRate;
-        uint256 startTime;
-        uint256 refundAmount;
+        int96 flowRate;        // Current stream flow rate
+        uint256 rewardDebt;    // Portion of accRewardPerShare already claimed
+        uint256 startTime;     // Timestamp when stream started
     }
 
     mapping(address => UserInfo) public users;
@@ -26,38 +33,64 @@ contract StreamingStaking is CFASuperAppBase{
         ISuperfluid _host,
         IConstantFlowAgreementV1 _cfa,
         ISuperToken _stakingTokenX,
-        IERC20 _rewardTokenY) CFASuperAppBase(_host)
-    {
+        IERC20 _rewardTokenY
+    ) CFASuperAppBase(_host) {
+        host = _host;
         cfa = _cfa;
         stakingTokenX = _stakingTokenX;
         rewardTokenY = _rewardTokenY;
 
-        // Register SuperApp
         uint256 configWord = SuperAppDefinitions.APP_LEVEL_FINAL;
         _host.registerApp(configWord);
+
+        lastRewardTime = block.timestamp;
     }
 
-    /// @notice Simulated method to add rewards, returns amount received
     function updateRewards() external {
-        IERC20(rewardTokenY).transferFrom(msg.sender, address(this), 100 ether);
-        totalRewardReceived += 100 ether;
+        // Simulate funding the reward pool
+        uint256 rewardAmount = 100 ether;
+        rewardTokenY.transferFrom(msg.sender, address(this), rewardAmount);
+        updatePool();
+        totalRewardReceived += rewardAmount;
+    }
+
+    function setRewardRatePerSecond(uint256 _rewardRatePerSecond) external {
+        updatePool();
+        rewardRatePerSecond = _rewardRatePerSecond;
+    }
+
+    function updatePool() internal {
+        uint256 currentTime = block.timestamp;
+        if (currentTime <= lastRewardTime || totalFlowRate == 0) {
+            lastRewardTime = currentTime;
+            return;
+        }
+
+        uint256 timeElapsed = currentTime - lastRewardTime;
+        uint256 reward = timeElapsed * rewardRatePerSecond;
+
+        accRewardPerShare += (reward * 1e18) / totalFlowRate;
+        lastRewardTime = currentTime;
     }
 
     function onFlowCreated(
         ISuperToken superToken,
         address sender,
         bytes calldata ctx
-    ) internal override returns (bytes memory /*newCtx*/) {
+    ) internal override returns (bytes memory) {
         require(superToken == stakingTokenX, "Invalid token");
+
+        updatePool();
 
         (, int96 flowRate,,) = cfa.getFlow(superToken, sender, address(this));
 
-        require(flowRate > 0, "FlowRate must be positive");
+        uint256 userFlow = uint256(uint96(flowRate));
+        totalFlowRate += userFlow;
 
         users[sender] = UserInfo({
             flowRate: flowRate,
-            startTime: block.timestamp,
-            refundAmount: 0
+            rewardDebt: (accRewardPerShare * userFlow) / 1e18,
+            startTime: block.timestamp
         });
 
         return ctx;
@@ -66,42 +99,31 @@ contract StreamingStaking is CFASuperAppBase{
     function onFlowDeleted(
         ISuperToken superToken,
         address sender,
-        address /*receiver*/,
-        int96 /*previousFlowRate*/,
-        uint256 /*lastUpdated*/,
+        address,
+        int96,
+        uint256,
         bytes calldata ctx
-    ) internal override returns (bytes memory /*newCtx*/) {
-        if (superToken != stakingTokenX) {
-            return ctx;
+    ) internal override returns (bytes memory) {
+        if (superToken != stakingTokenX) return ctx;
+
+        updatePool();
+
+        UserInfo storage user = users[sender];
+        uint256 userFlow = uint256(uint96(user.flowRate));
+        uint256 accumulated = (accRewardPerShare * userFlow) / 1e18;
+        uint256 pending = accumulated - user.rewardDebt;
+
+        if (pending > 0) {
+            rewardTokenY.transfer(sender, pending);
+            totalRewardReceived -= pending;
         }
 
-        (, int96 flowRate,uint256 deposit,) = cfa.getFlow(superToken, sender, address(this));
-        
-        // If flowRate is 0, the stream was terminated
-        if (flowRate == 0) {
-            users[sender].refundAmount = deposit;
-            _stopStream(sender);
-        }
+        (, , uint256 deposit,) = cfa.getFlow(superToken, sender, address(this));
+        stakingTokenX.transfer(sender, deposit);
+
+        totalFlowRate -= userFlow;
+        delete users[sender];
 
         return ctx;
-    }
-
-
-
-    function _stopStream(address user) internal {
-        UserInfo storage info = users[user];
-        require(info.flowRate > 0, "No active stream");
-
-        uint256 streamedTime = block.timestamp - info.startTime;
-        uint256 userStreamedXAmount = uint256(uint96(info.flowRate)) * streamedTime;
-
-        uint256 totalStreamedXAmount = stakingTokenX.balanceOf(address(this));
-        uint256 userShare = totalRewardReceived * userStreamedXAmount / totalStreamedXAmount;
-        totalRewardReceived -= userShare;
-
-        // Transfer reward Y and refund unspent X
-        rewardTokenY.transfer(user, userShare);
-        stakingTokenX.transfer(user, users[user].refundAmount);
-        delete users[user];
     }
 }
